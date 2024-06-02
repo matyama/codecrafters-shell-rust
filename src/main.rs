@@ -34,19 +34,19 @@ fn main() -> Result<()> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
-    write!(stdout, "{PROMPT} ")?;
-    stdout.flush()?;
+    loop {
+        write!(stdout, "{PROMPT} ")?;
+        stdout.flush()?;
 
-    let mut input = String::new();
-    stdin.read_line(&mut input)?;
+        let mut input = String::new();
+        stdin.read_line(&mut input)?;
 
-    match input.trim().parse::<Command>() {
-        Ok(cmd) => unimplemented!("handle {cmd}"),
-        Err(e) => {
-            writeln!(stderr, "{e}")?;
-            stderr.flush()?;
+        match input.trim().parse::<Command>() {
+            Ok(cmd) => unimplemented!("handle {cmd}"),
+            Err(e) => {
+                writeln!(stderr, "{e}")?;
+                stderr.flush()?;
+            }
         }
     }
-
-    Ok(())
 }
