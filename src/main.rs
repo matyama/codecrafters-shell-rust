@@ -19,6 +19,7 @@ enum Command {
     Noop,
     Exit(ExitCode),
     Echo(Box<[String]>),
+    Type(Box<[String]>),
 }
 
 impl Command {
@@ -29,10 +30,25 @@ impl Command {
     ) -> io::Result<ControlFlow<ExitCode>> {
         match self {
             Self::Noop => Ok(ControlFlow::Continue(())),
+
             Self::Exit(code) => Ok(ControlFlow::Break(code)),
+
             Self::Echo(args) => {
                 let args = args.join(" ");
                 writeln!(stdout, "{args}")?;
+                stdout.flush()?;
+                Ok(ControlFlow::Continue(()))
+            }
+
+            Self::Type(args) => {
+                for arg in args.iter() {
+                    match arg.as_str() {
+                        name @ ("exit" | "echo" | "type") => {
+                            writeln!(stdout, "{name} is a shell builtin")?
+                        }
+                        cmd => writeln!(stdout, "{cmd} not found")?,
+                    }
+                }
                 stdout.flush()?;
                 Ok(ControlFlow::Continue(()))
             }
@@ -47,6 +63,7 @@ impl std::fmt::Display for Command {
             Self::Noop => Ok(()),
             Self::Exit(_) => write!(f, "exit"),
             Self::Echo(_) => write!(f, "echo"),
+            Self::Type(_) => write!(f, "type"),
         }
     }
 }
@@ -72,9 +89,11 @@ impl FromStr for Command {
                 _ => Err(Error::TooManyArgs(cmd.to_string())),
             },
 
-            // TODO: support operands
-            // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/echo.html
+            // TODO: support operands (https://manned.org/echo)
             "echo" => Ok(Command::Echo(args.iter().map(|s| s.to_string()).collect())),
+
+            // TODO: support operands (https://manned.org/type)
+            "type" => Ok(Command::Type(args.iter().map(|s| s.to_string()).collect())),
 
             cmd => Err(Error::CommandNotFound(cmd.to_string())),
         }
