@@ -1,7 +1,9 @@
 use std::io::{self, Write as _};
 use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::{env, fs};
 
 // TODO: <'a>, possibly Cow<'a, str>
 
@@ -28,31 +30,44 @@ impl Command {
         stdout: &mut io::Stdout,
         _stderr: &mut io::Stderr,
     ) -> io::Result<ControlFlow<ExitCode>> {
+        use ControlFlow::*;
         match self {
-            Self::Noop => Ok(ControlFlow::Continue(())),
+            Self::Noop => Ok(Continue(())),
 
-            Self::Exit(code) => Ok(ControlFlow::Break(code)),
+            Self::Exit(code) => Ok(Break(code)),
 
             Self::Echo(args) => {
                 let args = args.join(" ");
                 writeln!(stdout, "{args}")?;
-                stdout.flush()?;
-                Ok(ControlFlow::Continue(()))
+                stdout.flush().map(Continue)
             }
 
             Self::Type(args) => {
+                let path = env::var("PATH").unwrap_or_default();
+                let path = path.split(':').map(Path::new).collect::<Vec<_>>();
+
                 for arg in args.iter() {
-                    match arg.as_str() {
-                        name @ ("exit" | "echo" | "type") => {
-                            writeln!(stdout, "{name} is a shell builtin")?
-                        }
-                        cmd => writeln!(stdout, "{cmd} not found")?,
-                    }
+                    Self::exec_type(arg, &path, stdout)?;
                 }
-                stdout.flush()?;
-                Ok(ControlFlow::Continue(()))
+
+                stdout.flush().map(Continue)
             }
         }
+    }
+
+    fn exec_type(arg: &str, env: &[&Path], stdout: &mut io::Stdout) -> io::Result<()> {
+        if matches!(arg, "exit" | "echo" | "type") {
+            return writeln!(stdout, "{arg} is a shell builtin");
+        }
+
+        for path in env {
+            let mut finder = FindExecutable { target: arg };
+            if let Some(exe) = finder.visit(path)? {
+                return writeln!(stdout, "{arg} is {}", exe.display());
+            }
+        }
+
+        writeln!(stdout, "{arg} not found")
     }
 }
 
@@ -97,6 +112,76 @@ impl FromStr for Command {
 
             cmd => Err(Error::CommandNotFound(cmd.to_string())),
         }
+    }
+}
+
+trait FSVisitor {
+    type Output;
+
+    fn visit_file(&mut self, file: &Path) -> ControlFlow<Self::Output>;
+
+    fn visit_entry(&mut self, entry: &fs::DirEntry) -> ControlFlow<Self::Output>;
+
+    #[inline]
+    fn visit(&mut self, path: &Path) -> io::Result<Option<Self::Output>> {
+        self.visit_rec(path).map(|res| match res {
+            ControlFlow::Break(res) => Some(res),
+            ControlFlow::Continue(_) => None,
+        })
+    }
+
+    fn visit_rec(&mut self, path: &Path) -> io::Result<ControlFlow<Self::Output>> {
+        match path {
+            dir if dir.is_dir() => {
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+
+                    if let res @ ControlFlow::Break(_) = self.visit_entry(&entry) {
+                        return Ok(res);
+                    }
+
+                    let path = entry.path();
+
+                    // prevent cycles by excluding symlinks
+                    if path.is_dir() && !path.is_symlink() {
+                        if let res @ ControlFlow::Break(_) = self.visit_rec(&path)? {
+                            return Ok(res);
+                        }
+                    }
+                }
+
+                Ok(ControlFlow::Continue(()))
+            }
+
+            file if file.is_file() => Ok(self.visit_file(file)),
+
+            _ => Ok(ControlFlow::Continue(())),
+        }
+    }
+}
+
+struct FindExecutable<'a> {
+    target: &'a str,
+}
+
+impl FSVisitor for FindExecutable<'_> {
+    // TODO: try to do this without alloc
+    type Output = PathBuf;
+
+    fn visit_file(&mut self, file: &Path) -> ControlFlow<Self::Output> {
+        debug_assert!(file.is_file());
+        if file.file_name().map_or(false, |f| f == self.target) {
+            return ControlFlow::Break(file.to_path_buf());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn visit_entry(&mut self, entry: &fs::DirEntry) -> ControlFlow<Self::Output> {
+        let path = entry.path();
+        if path.is_file() {
+            return self.visit_file(path.as_path());
+        }
+        ControlFlow::Continue(())
     }
 }
 
