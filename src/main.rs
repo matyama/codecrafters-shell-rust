@@ -1,6 +1,9 @@
 use std::io::{self, Write as _};
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 use std::str::FromStr;
+
+// TODO: <'a>, possibly Cow<'a, str>
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -15,6 +18,26 @@ enum Error {
 enum Command {
     Noop,
     Exit(ExitCode),
+    Echo(Box<[String]>),
+}
+
+impl Command {
+    pub fn exec(
+        self,
+        stdout: &mut io::Stdout,
+        _stderr: &mut io::Stderr,
+    ) -> io::Result<ControlFlow<ExitCode>> {
+        match self {
+            Self::Noop => Ok(ControlFlow::Continue(())),
+            Self::Exit(code) => Ok(ControlFlow::Break(code)),
+            Self::Echo(args) => {
+                let args = args.join(" ");
+                writeln!(stdout, "{args}")?;
+                stdout.flush()?;
+                Ok(ControlFlow::Continue(()))
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Command {
@@ -23,6 +46,7 @@ impl std::fmt::Display for Command {
         match self {
             Self::Noop => Ok(()),
             Self::Exit(_) => write!(f, "exit"),
+            Self::Echo(_) => write!(f, "echo"),
         }
     }
 }
@@ -47,6 +71,11 @@ impl FromStr for Command {
                 }
                 _ => Err(Error::TooManyArgs(cmd.to_string())),
             },
+
+            // TODO: support operands
+            // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/echo.html
+            "echo" => Ok(Command::Echo(args.iter().map(|s| s.to_string()).collect())),
+
             cmd => Err(Error::CommandNotFound(cmd.to_string())),
         }
     }
@@ -61,21 +90,22 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error + 'static>> {
         write!(stdout, "$ ")?;
         stdout.flush()?;
 
+        // TODO: reuse single BytesMut (as a bytes pool) outside the loop
         let mut input = String::new();
         stdin.read_line(&mut input)?;
 
-        let cmd = match input.parse() {
+        let cmd = match input.parse::<Command>() {
             Ok(cmd) => cmd,
-            Err(e) => {
-                writeln!(stderr, "{e}")?;
+            Err(err) => {
+                writeln!(stderr, "{err}")?;
                 stderr.flush()?;
                 continue;
             }
         };
 
-        match cmd {
-            Command::Noop => continue,
-            Command::Exit(code) => break Ok(code),
+        match cmd.exec(&mut stdout, &mut stderr)? {
+            ControlFlow::Break(code) => break Ok(code),
+            ControlFlow::Continue(_) => continue,
         }
     }
 }
