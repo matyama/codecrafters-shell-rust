@@ -22,6 +22,7 @@ enum Error {
 #[derive(Debug)]
 enum ShellCmd {
     Noop,
+    Pwd,
     Exit(ExitCode),
     Echo(Box<[String]>),
     Type(Box<[String]>),
@@ -37,6 +38,12 @@ impl ShellCmd {
         use ControlFlow::*;
         match self {
             Self::Noop => Ok(Continue(())),
+
+            Self::Pwd => {
+                let pwd = env::current_dir()?;
+                writeln!(stdout, "{}", pwd.display())?;
+                Ok(Continue(()))
+            }
 
             Self::Exit(code) => Ok(Break(code)),
 
@@ -77,6 +84,7 @@ impl std::fmt::Display for ShellCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Noop => Ok(()),
+            Self::Pwd => write!(f, "pwd"),
             Self::Exit(_) => write!(f, "exit"),
             Self::Echo(_) => write!(f, "echo"),
             Self::Type(_) => write!(f, "type"),
@@ -97,6 +105,9 @@ impl FromStr for ShellCmd {
         };
 
         match cmd {
+            // TODO: support options (https://manned.org/pwd)
+            "pwd" => Ok(ShellCmd::Pwd),
+
             "exit" => match *args {
                 [] => Ok(ShellCmd::Exit(ExitCode::SUCCESS)),
                 [arg] => {
