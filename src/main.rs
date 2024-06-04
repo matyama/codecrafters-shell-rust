@@ -1,7 +1,7 @@
 use std::io::{self, Write as _};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::str::FromStr;
 use std::{env, fs};
 
@@ -14,17 +14,21 @@ enum Error {
 
     #[error("{0}: too many arguments")]
     TooManyArgs(String),
+
+    #[error(transparent)]
+    IO(#[from] io::Error),
 }
 
 #[derive(Debug)]
-enum Command {
+enum ShellCmd {
     Noop,
     Exit(ExitCode),
     Echo(Box<[String]>),
     Type(Box<[String]>),
+    Exec(String, PathBuf, Vec<String>),
 }
 
-impl Command {
+impl ShellCmd {
     pub fn exec(
         self,
         stdout: &mut io::Stdout,
@@ -47,31 +51,28 @@ impl Command {
                 let path = path.split(':').map(Path::new).collect::<Vec<_>>();
 
                 for arg in args.iter() {
-                    Self::exec_type(arg, &path, stdout)?;
+                    match find_type(arg, &path)? {
+                        Some(Type::Builtin) => writeln!(stdout, "{arg} is a shell builtin")?,
+                        Some(Type::Executable(path)) => {
+                            writeln!(stdout, "{arg} is {}", path.display())?
+                        }
+                        None => writeln!(stdout, "{arg} not found")?,
+                    }
                 }
 
                 stdout.flush().map(Continue)
             }
-        }
-    }
 
-    fn exec_type(arg: &str, env: &[&Path], stdout: &mut io::Stdout) -> io::Result<()> {
-        if matches!(arg, "exit" | "echo" | "type") {
-            return writeln!(stdout, "{arg} is a shell builtin");
+            Self::Exec(prog, _path, args) => Command::new(prog)
+                .args(args)
+                .spawn()?
+                .wait()
+                .map(|_status| Continue(())),
         }
-
-        for path in env {
-            let mut finder = FindExecutable { target: arg };
-            if let Some(exe) = finder.visit(path)? {
-                return writeln!(stdout, "{arg} is {}", exe.display());
-            }
-        }
-
-        writeln!(stdout, "{arg} not found")
     }
 }
 
-impl std::fmt::Display for Command {
+impl std::fmt::Display for ShellCmd {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -79,11 +80,12 @@ impl std::fmt::Display for Command {
             Self::Exit(_) => write!(f, "exit"),
             Self::Echo(_) => write!(f, "echo"),
             Self::Type(_) => write!(f, "type"),
+            Self::Exec(prog, ..) => write!(f, "{prog}"),
         }
     }
 }
 
-impl FromStr for Command {
+impl FromStr for ShellCmd {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
@@ -91,28 +93,59 @@ impl FromStr for Command {
         let args: Vec<_> = input.split_whitespace().collect();
 
         let Some((&cmd, args)) = args.split_first() else {
-            return Ok(Command::Noop);
+            return Ok(ShellCmd::Noop);
         };
 
         match cmd {
             "exit" => match *args {
-                [] => Ok(Command::Exit(ExitCode::SUCCESS)),
+                [] => Ok(ShellCmd::Exit(ExitCode::SUCCESS)),
                 [arg] => {
                     let code = arg.parse::<u8>().map_or(ExitCode::FAILURE, ExitCode::from);
-                    Ok(Command::Exit(code))
+                    Ok(ShellCmd::Exit(code))
                 }
                 _ => Err(Error::TooManyArgs(cmd.to_string())),
             },
 
             // TODO: support operands (https://manned.org/echo)
-            "echo" => Ok(Command::Echo(args.iter().map(|s| s.to_string()).collect())),
+            "echo" => Ok(ShellCmd::Echo(args.iter().map(|s| s.to_string()).collect())),
 
             // TODO: support operands (https://manned.org/type)
-            "type" => Ok(Command::Type(args.iter().map(|s| s.to_string()).collect())),
+            "type" => Ok(ShellCmd::Type(args.iter().map(|s| s.to_string()).collect())),
 
-            cmd => Err(Error::CommandNotFound(cmd.to_string())),
+            cmd => {
+                let path = env::var("PATH").unwrap_or_default();
+                let path = path.split(':').map(Path::new).collect::<Vec<_>>();
+
+                let Some(Type::Executable(path)) = find_type(cmd, &path)? else {
+                    return Err(Error::CommandNotFound(cmd.to_string()));
+                };
+
+                let args = args.iter().map(|arg| arg.to_string()).collect();
+                Ok(ShellCmd::Exec(cmd.to_string(), path, args))
+            }
         }
     }
+}
+
+#[derive(Debug)]
+enum Type {
+    Builtin,
+    Executable(PathBuf),
+}
+
+fn find_type(arg: &str, env: &[&Path]) -> io::Result<Option<Type>> {
+    if matches!(arg, "exit" | "echo" | "type") {
+        return Ok(Some(Type::Builtin));
+    }
+
+    for path in env {
+        let mut finder = FindExecutable { target: arg };
+        if let Some(exe) = finder.visit(path)? {
+            return Ok(Some(Type::Executable(exe)));
+        }
+    }
+
+    Ok(None)
 }
 
 trait FSVisitor {
@@ -198,8 +231,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error + 'static>> {
         let mut input = String::new();
         stdin.read_line(&mut input)?;
 
-        let cmd = match input.parse::<Command>() {
+        let cmd = match input.parse::<ShellCmd>() {
             Ok(cmd) => cmd,
+            Err(Error::IO(err)) => Err(err)?,
             Err(err) => {
                 writeln!(stderr, "{err}")?;
                 stderr.flush()?;
