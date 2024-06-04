@@ -5,6 +5,13 @@ use std::process::{Command, ExitCode};
 use std::str::FromStr;
 use std::{env, fs};
 
+#[inline]
+fn home_dir() -> Option<PathBuf> {
+    // NOTE: there are easy drop-in replacements (e.g., https://crates.io/crates/home)
+    #[allow(deprecated)]
+    env::home_dir()
+}
+
 // TODO: <'a>, possibly Cow<'a, str>
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +24,9 @@ enum Error {
 
     #[error("{}: No such file or directory", .0.display())]
     NoSuchFileOrDir(PathBuf),
+
+    #[error("No home directory")]
+    NoHomeDir,
 
     #[error(transparent)]
     IO(#[from] io::Error),
@@ -124,11 +134,18 @@ impl FromStr for ShellCmd {
 
             // TODO: support options (https://manned.org/cd)
             "cd" => match args.first().map(Path::new) {
+                Some(path) if path.as_os_str() == "~" => {
+                    let home = home_dir().ok_or(Error::NoHomeDir)?;
+                    Ok(ShellCmd::Cd(home))
+                }
                 Some(path) if path.exists() && path.is_dir() => {
                     Ok(ShellCmd::Cd(path.to_path_buf()))
                 }
                 Some(path) => Err(Error::NoSuchFileOrDir(path.to_path_buf())),
-                None => Ok(ShellCmd::Cd(Path::new("~").to_path_buf())),
+                None => {
+                    let home = home_dir().ok_or(Error::NoHomeDir)?;
+                    Ok(ShellCmd::Cd(home))
+                }
             },
 
             "exit" => match *args {
