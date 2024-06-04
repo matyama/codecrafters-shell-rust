@@ -15,6 +15,9 @@ enum Error {
     #[error("{0}: too many arguments")]
     TooManyArgs(String),
 
+    #[error("{}: No such file or directory", .0.display())]
+    NoSuchFileOrDir(PathBuf),
+
     #[error(transparent)]
     IO(#[from] io::Error),
 }
@@ -24,6 +27,7 @@ enum ShellCmd {
     Noop,
     Pwd,
     Exit(ExitCode),
+    Cd(PathBuf),
     Echo(Box<[String]>),
     Type(Box<[String]>),
     Exec(String, PathBuf, Vec<String>),
@@ -33,7 +37,7 @@ impl ShellCmd {
     pub fn exec(
         self,
         stdout: &mut io::Stdout,
-        _stderr: &mut io::Stderr,
+        stderr: &mut io::Stderr,
     ) -> io::Result<ControlFlow<ExitCode>> {
         use ControlFlow::*;
         match self {
@@ -43,6 +47,15 @@ impl ShellCmd {
                 let pwd = env::current_dir()?;
                 writeln!(stdout, "{}", pwd.display())?;
                 Ok(Continue(()))
+            }
+
+            Self::Cd(path) if path.exists() && path.is_dir() => {
+                env::set_current_dir(path).map(Continue)
+            }
+
+            Self::Cd(path) => {
+                writeln!(stderr, "{}", Error::NoSuchFileOrDir(path))?;
+                stderr.flush().map(Continue)
             }
 
             Self::Exit(code) => Ok(Break(code)),
@@ -85,6 +98,7 @@ impl std::fmt::Display for ShellCmd {
         match self {
             Self::Noop => Ok(()),
             Self::Pwd => write!(f, "pwd"),
+            Self::Cd(_) => write!(f, "cd"),
             Self::Exit(_) => write!(f, "exit"),
             Self::Echo(_) => write!(f, "echo"),
             Self::Type(_) => write!(f, "type"),
@@ -107,6 +121,15 @@ impl FromStr for ShellCmd {
         match cmd {
             // TODO: support options (https://manned.org/pwd)
             "pwd" => Ok(ShellCmd::Pwd),
+
+            // TODO: support options (https://manned.org/cd)
+            "cd" => match args.first().map(Path::new) {
+                Some(path) if path.exists() && path.is_dir() => {
+                    Ok(ShellCmd::Cd(path.to_path_buf()))
+                }
+                Some(path) => Err(Error::NoSuchFileOrDir(path.to_path_buf())),
+                None => Ok(ShellCmd::Cd(Path::new("~").to_path_buf())),
+            },
 
             "exit" => match *args {
                 [] => Ok(ShellCmd::Exit(ExitCode::SUCCESS)),
