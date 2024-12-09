@@ -16,6 +16,9 @@ fn home_dir() -> Option<PathBuf> {
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("quote")]
+    Quote,
+
     #[error("{0}: command not found")]
     CommandNotFound(String),
 
@@ -86,7 +89,7 @@ impl ShellCmd {
                         Some(Type::Executable(path)) => {
                             writeln!(stdout, "{arg} is {}", path.display())?
                         }
-                        None => writeln!(stdout, "{arg} not found")?,
+                        None => writeln!(stdout, "{arg}: not found")?,
                     }
                 }
 
@@ -121,12 +124,18 @@ impl FromStr for ShellCmd {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        // TODO: no alloc
-        let args: Vec<_> = input.split_whitespace().collect();
+        let mut args = ArgParser::new(input).into_iter();
 
-        let Some((&cmd, args)) = args.split_first() else {
-            return Ok(ShellCmd::Noop);
+        let cmd = match args.next() {
+            Some(Ok(cmd)) => cmd,
+            Some(Err(e)) => return Err(e),
+            None => return Ok(ShellCmd::Noop),
         };
+
+        // XXX: ShellCmd<'a> => `arg.map(Cow::Borrowed)` or even directly `&'a str`
+        let args = args
+            .map(|arg| arg.map(String::from))
+            .collect::<Result<Vec<_>, _>>()?;
 
         match cmd {
             // TODO: support options (https://manned.org/pwd)
@@ -148,7 +157,7 @@ impl FromStr for ShellCmd {
                 }
             },
 
-            "exit" => match *args {
+            "exit" => match args.as_slice() {
                 [] => Ok(ShellCmd::Exit(ExitCode::SUCCESS)),
                 [arg] => {
                     let code = arg.parse::<u8>().map_or(ExitCode::FAILURE, ExitCode::from);
@@ -158,10 +167,10 @@ impl FromStr for ShellCmd {
             },
 
             // TODO: support operands (https://manned.org/echo)
-            "echo" => Ok(ShellCmd::Echo(args.iter().map(|s| s.to_string()).collect())),
+            "echo" => Ok(ShellCmd::Echo(args.into_boxed_slice())),
 
             // TODO: support operands (https://manned.org/type)
-            "type" => Ok(ShellCmd::Type(args.iter().map(|s| s.to_string()).collect())),
+            "type" => Ok(ShellCmd::Type(args.into_boxed_slice())),
 
             cmd => {
                 let path = env::var("PATH").unwrap_or_default();
@@ -171,8 +180,89 @@ impl FromStr for ShellCmd {
                     return Err(Error::CommandNotFound(cmd.to_string()));
                 };
 
-                let args = args.iter().map(|arg| arg.to_string()).collect();
                 Ok(ShellCmd::Exec(cmd.to_string(), path, args))
+            }
+        }
+    }
+}
+
+struct ArgParser<'a> {
+    args: &'a str,
+}
+
+impl<'a> ArgParser<'a> {
+    #[inline]
+    fn new(args: &'a str) -> Self {
+        Self { args }
+    }
+}
+
+impl<'a> IntoIterator for ArgParser<'a> {
+    type Item = <ArgsIter<'a> as Iterator>::Item;
+    type IntoIter = ArgsIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        ArgsIter {
+            args: self.args,
+            iter: self.args.chars(),
+            pos: 0,
+        }
+    }
+}
+
+struct ArgsIter<'a> {
+    args: &'a str,
+    iter: std::str::Chars<'a>,
+    pos: usize,
+}
+
+impl<'a> Iterator for ArgsIter<'a> {
+    type Item = Result<&'a str, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut start = self.pos;
+        let mut quote = None;
+
+        loop {
+            let Some(next) = self.iter.next() else {
+                return quote.map(|_| Err(Error::Quote));
+            };
+
+            self.pos += 1;
+
+            match next {
+                c @ '\'' => match quote {
+                    Some('\'') => {
+                        // found a closing quote
+                        // remove the single quote from the literal argument value
+                        return Some(Ok(&self.args[start..self.pos - 1]));
+                    }
+                    Some(c) => panic!("{c} is not a (supported) quote"),
+                    None => {
+                        // found an opening single quote
+                        let _ = quote.insert(c);
+                        // remove the single quote from the literal argument value
+                        start = self.pos;
+                    }
+                },
+                c if c.is_whitespace() => match quote {
+                    // preserve literal whitespace inside quotes
+                    Some('\'') => continue,
+                    Some(c) => panic!("{c} is not a (supported) quote"),
+                    None => {
+                        let arg = &self.args[start..self.pos - 1];
+                        if arg.is_empty() {
+                            // ignore non-literal whitespace
+                            start = self.pos;
+                        } else {
+                            // yield next argument separated by this whitespace
+                            return Some(Ok(arg));
+                        }
+                    }
+                },
+                // implicitly add this character to the current argument
+                _ => continue,
             }
         }
     }
@@ -185,7 +275,7 @@ enum Type {
 }
 
 fn find_type(arg: &str, env: &[&Path]) -> io::Result<Option<Type>> {
-    if matches!(arg, "exit" | "echo" | "type") {
+    if matches!(arg, "exit" | "echo" | "pwd" | "type") {
         return Ok(Some(Type::Builtin));
     }
 
@@ -269,25 +359,55 @@ impl FSVisitor for FindExecutable<'_> {
     }
 }
 
+#[derive(Debug, Default)]
+enum Prompt {
+    #[default]
+    User,
+    //Root(String),
+    Quote,
+}
+
+impl std::fmt::Display for Prompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => write!(f, "$"),
+            //Self::Root(name) => write!(f, "{name}#"),
+            Self::Quote => write!(f, "quote>"),
+        }
+    }
+}
+
 fn main() -> Result<ExitCode, Box<dyn std::error::Error + 'static>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
+    let mut prompt = Prompt::default();
+    let mut input = String::new();
+
     loop {
-        write!(stdout, "$ ")?;
+        write!(stdout, "{prompt} ")?;
         stdout.flush()?;
 
-        // TODO: reuse single BytesMut (as a bytes pool) outside the loop
-        let mut input = String::new();
         stdin.read_line(&mut input)?;
 
         let cmd = match input.parse::<ShellCmd>() {
-            Ok(cmd) => cmd,
+            Ok(cmd) => {
+                input.clear();
+                prompt = Prompt::default();
+                cmd
+            }
             Err(Error::IO(err)) => Err(err)?,
+            Err(Error::Quote) => {
+                // NOTE: don't clear the buffer to preserve previous inputs
+                prompt = Prompt::Quote;
+                continue;
+            }
             Err(err) => {
                 writeln!(stderr, "{err}")?;
                 stderr.flush()?;
+                input.clear();
+                prompt = Prompt::default();
                 continue;
             }
         };
