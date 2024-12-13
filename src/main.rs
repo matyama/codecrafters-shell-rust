@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::{env, fs};
 
 use crate::error::Error;
-use crate::parser::ArgParser;
+use crate::parser::{ArgParser, Quote};
 
 mod error;
 mod parser;
@@ -265,7 +265,7 @@ enum Prompt {
     #[default]
     User,
     //Root(String),
-    Quote,
+    Quote(Quote),
 }
 
 impl std::fmt::Display for Prompt {
@@ -273,7 +273,7 @@ impl std::fmt::Display for Prompt {
         match self {
             Self::User => write!(f, "$"),
             //Self::Root(name) => write!(f, "{name}#"),
-            Self::Quote => write!(f, "quote>"),
+            Self::Quote(quote) => write!(f, "{quote}>"),
         }
     }
 }
@@ -299,9 +299,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error + 'static>> {
                 cmd
             }
             Err(Error::IO(err)) => Err(err)?,
-            Err(Error::Quote) => {
+            Err(Error::Quote(quote)) => {
                 // NOTE: don't clear the buffer to preserve previous inputs
-                prompt = Prompt::Quote;
+                prompt = Prompt::Quote(quote);
                 continue;
             }
             Err(err) => {

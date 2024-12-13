@@ -33,9 +33,25 @@ impl<'a> IntoIterator for ArgParser<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Quote {
+pub enum Quote {
     Single,
     Double,
+}
+
+impl std::fmt::Display for Quote {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single => f.write_str("quote"),
+            Self::Double => f.write_str("dquote"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Token {
+    Escape,
+    Literal(char),
 }
 
 pub struct ArgsIter<'a> {
@@ -82,7 +98,7 @@ impl<'a> Iterator for ArgsIter<'a> {
             let Some(next) = self.iter.next() else {
                 return match quote {
                     // error on non-terminated quote
-                    Some(_) => Some(Err(Error::Quote)),
+                    Some(quote) => Some(Err(Error::Quote(quote))),
                     // stop the iteration when there's no argument
                     None if arg.is_empty() => None,
                     // yield final argument
@@ -123,8 +139,12 @@ impl<'a> Iterator for ArgsIter<'a> {
                 // handle double quotes
                 c @ '"' => match quote {
                     // escaped double quote inside a double quote is treated as literal
-                    Some(Quote::Double) if matches!(prev, Some('\\')) => {
-                        arg = self.add(arg, start, c)
+                    Some(Quote::Double) if matches!(prev, Some(Token::Escape)) => {
+                        match self.iter.peek() {
+                            None => return Some(Ok(arg)),
+                            Some(c) if c.is_whitespace() => return Some(Ok(arg)),
+                            Some(_) => arg = self.add(arg, start, c),
+                        }
                     }
 
                     // found a closing quote
@@ -140,7 +160,7 @@ impl<'a> Iterator for ArgsIter<'a> {
                     Some(Quote::Single) => arg = self.add(arg, start, c),
 
                     // escaped double quote outside a double quote is treated as literal
-                    None if matches!(prev, Some('\\')) => arg = self.add(arg, start, c),
+                    None if matches!(prev, Some(Token::Escape)) => arg = self.add(arg, start, c),
 
                     // found an opening single quote
                     None => {
@@ -163,7 +183,19 @@ impl<'a> Iterator for ArgsIter<'a> {
                     Some(Quote::Double)
                         if matches!(self.iter.peek(), Some('\\' | '$' | '"' | '\n')) =>
                     {
-                        arg = Cow::Owned(arg.into_owned());
+                        arg = match prev {
+                            Some(Token::Escape) => {
+                                arg = self.add(arg, start, c);
+                                prev = Some(Token::Literal(c));
+                                continue;
+                            }
+                            Some(Token::Literal('\\')) => {
+                                prev = Some(Token::Literal(c));
+                                continue;
+                            }
+                            Some(_) => Cow::Owned(arg.into_owned()),
+                            None => Cow::Owned(arg.into_owned()),
+                        };
                     }
 
                     // other occurrences of a backslash inside a double quote is treated as literal
@@ -171,10 +203,24 @@ impl<'a> Iterator for ArgsIter<'a> {
 
                     // backslash outside of quotes serving as an escape character
                     None if matches!(self.iter.peek(), Some('\\')) => {
-                        arg = self.add(arg, start, c);
+                        arg = match prev {
+                            Some(Token::Escape) => {
+                                arg = self.add(arg, start, c);
+                                prev = Some(Token::Literal(c));
+                                continue;
+                            }
+                            Some(Token::Literal('\\')) => {
+                                prev = Some(Token::Literal(c));
+                                continue;
+                            }
+                            Some(_) => Cow::Owned(arg.into_owned()),
+                            None => Cow::Owned(arg.into_owned()),
+                        };
                     }
 
                     // backslash outside of quotes
+                    None if matches!(prev, Some(Token::Escape)) => arg = self.add(arg, start, c),
+
                     None => arg = Cow::Owned(arg.into_owned()),
                 },
 
@@ -182,7 +228,7 @@ impl<'a> Iterator for ArgsIter<'a> {
                 c if c.is_whitespace() && quote.is_none() => {
                     match prev {
                         // escaped whitespace outside of quotes is treated as literal
-                        Some('\\') => arg = self.add(arg, start, c),
+                        Some(Token::Escape) => arg = self.add(arg, start, c),
 
                         // non-escaped whitespace outside of quotes is ignored
                         _ if arg.is_empty() => start = self.pos,
@@ -197,7 +243,11 @@ impl<'a> Iterator for ArgsIter<'a> {
                 c => arg = self.add(arg, start, c),
             }
 
-            prev = Some(next);
+            // backslash is an escape character by default, literal backslash is handled above
+            prev = Some(match next {
+                '\\' => Token::Escape,
+                c => Token::Literal(c),
+            });
         }
     }
 }
@@ -249,6 +299,9 @@ mod tests {
         let args = parse(r#"echo x\\y bar"#).expect("no parsing error");
         assert_eq!(args, vec!["echo", r#"x\y"#, "bar"]);
 
+        let args = parse(r#"echo hello\\\\world"#).expect("no parsing error");
+        assert_eq!(args, vec!["echo", r#"hello\world"#]);
+
         let args = parse(r#"echo world\ \ \ \ \ \ script"#).expect("no parsing error");
         assert_eq!(args, vec!["echo", "world      script"]);
     }
@@ -264,10 +317,22 @@ mod tests {
 
     #[test]
     fn backslash_within_double_quotes() {
+        let args = parse(r#"echo "\\""#).expect("no parsing error");
+        assert_eq!(args, vec!["echo", r#"\"#]);
+
+        let args = parse(r#"echo "\\"hello"#).expect("no parsing error");
+        assert_eq!(args, vec!["echo", r#"\hello"#]);
+
+        let args = parse(r#"echo "\\\\"hello"#).expect("no parsing error");
+        assert_eq!(args, vec!["echo", r#"\hello"#]);
+
         let args = parse(r#"echo "hello'script'\\n'world""#).expect("no parsing error");
         assert_eq!(args, vec!["echo", r#"hello'script'\n'world"#]);
 
         let args = parse(r#"echo "hello\"insidequotes"script\""#).expect("no parsing error");
         assert_eq!(args, vec!["echo", r#"hello"insidequotesscript""#]);
+
+        let args = parse(r#"echo "mixed\"quote'hello'\\""#).expect("no parsing error");
+        assert_eq!(args, vec!["echo", r#"mixed"quote'hello'\"#]);
     }
 }

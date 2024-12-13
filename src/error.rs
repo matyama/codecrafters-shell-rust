@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
+use crate::parser::Quote;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("quote")]
-    Quote,
+    #[error("{0}")]
+    Quote(Quote),
 
     #[error("{0}: command not found")]
     CommandNotFound(String),
