@@ -1,39 +1,21 @@
 use std::io::{self, Write as _};
-use std::iter::Peekable;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::str::{Chars, FromStr};
+use std::str::FromStr;
 use std::{env, fs};
+
+use crate::error::Error;
+use crate::parser::ArgParser;
+
+mod error;
+mod parser;
 
 #[inline]
 fn home_dir() -> Option<PathBuf> {
     // NOTE: there are easy drop-in replacements (e.g., https://crates.io/crates/home)
     #[allow(deprecated)]
     env::home_dir()
-}
-
-// TODO: <'a>, possibly Cow<'a, str>
-
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("quote")]
-    Quote,
-
-    #[error("{0}: command not found")]
-    CommandNotFound(String),
-
-    #[error("{0}: too many arguments")]
-    TooManyArgs(String),
-
-    #[error("{}: No such file or directory", .0.display())]
-    NoSuchFileOrDir(PathBuf),
-
-    #[error("No home directory")]
-    NoHomeDir,
-
-    #[error(transparent)]
-    IO(#[from] io::Error),
 }
 
 #[derive(Debug)]
@@ -138,7 +120,7 @@ impl FromStr for ShellCmd {
             .map(|arg| arg.map(String::from))
             .collect::<Result<Vec<_>, _>>()?;
 
-        match cmd {
+        match cmd.as_ref() {
             // TODO: support options (https://manned.org/pwd)
             "pwd" => Ok(ShellCmd::Pwd),
 
@@ -182,138 +164,6 @@ impl FromStr for ShellCmd {
                 };
 
                 Ok(ShellCmd::Exec(cmd.to_string(), path, args))
-            }
-        }
-    }
-}
-
-struct ArgParser<'a> {
-    args: &'a str,
-}
-
-impl<'a> ArgParser<'a> {
-    #[inline]
-    fn new(args: &'a str) -> Self {
-        Self { args }
-    }
-}
-
-impl<'a> IntoIterator for ArgParser<'a> {
-    type Item = <ArgsIter<'a> as Iterator>::Item;
-    type IntoIter = ArgsIter<'a>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        ArgsIter {
-            args: self.args,
-            iter: self.args.chars().peekable(),
-            pos: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Quote {
-    Single,
-    Double,
-}
-
-impl From<Quote> for char {
-    #[inline]
-    fn from(quote: Quote) -> Self {
-        match quote {
-            Quote::Single => '\'',
-            Quote::Double => '"',
-        }
-    }
-}
-
-struct ArgsIter<'a> {
-    args: &'a str,
-    iter: Peekable<Chars<'a>>,
-    pos: usize,
-}
-
-impl<'a> Iterator for ArgsIter<'a> {
-    // XXX: might have to return Cow<'a, str> here due to quoting
-    type Item = Result<&'a str, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut start = self.pos;
-        let mut quote = None;
-
-        loop {
-            let Some(next) = self.iter.next() else {
-                return quote.map(|_| Err(Error::Quote));
-            };
-
-            self.pos += 1;
-
-            match next {
-                // handle single quotes
-                '\'' => match quote {
-                    // found a closing quote
-                    Some(Quote::Single) => {
-                        // remove the quote from the literal argument value
-                        return Some(Ok(&self.args[start..self.pos - 1]));
-                    }
-                    // treat the single quote as a regular character
-                    Some(Quote::Double) => continue,
-                    // found an opening quote
-                    None => {
-                        let _ = quote.insert(Quote::Single);
-                        // remove the quote from the literal argument value
-                        start = self.pos;
-                    }
-                },
-
-                // handle double quotes
-                '"' => match quote {
-                    // found a closing quote
-                    Some(Quote::Double) => {
-                        // remove the quote from the literal argument value
-                        return Some(Ok(&self.args[start..self.pos - 1]));
-                    }
-                    // treat the double quote as a regular character
-                    Some(Quote::Single) => continue,
-                    // found an opening single quote
-                    None => {
-                        let _ = quote.insert(Quote::Double);
-                        // remove the quote from the literal argument value
-                        start = self.pos;
-                    }
-                },
-
-                '\\' => match quote {
-                    // TODO: backslash inside single quotes
-                    Some(Quote::Single) => continue,
-                    // TODO: backslash inside double quotes
-                    Some(Quote::Double) => continue,
-                    // ignore backslash outside of quotes
-                    // FIXME: `echo foo x\\y bar` should output `foo x\y bar`, not `foo \y bar`
-                    None if matches!(self.iter.peek(), Some('\\')) => start = self.pos,
-                    None => continue,
-                },
-
-                // handle whitespaces
-                c if c.is_whitespace() => {
-                    if quote.is_some() {
-                        // preserve literal whitespace inside quotes
-                        continue;
-                    }
-
-                    let arg = &self.args[start..self.pos - 1];
-                    if arg.is_empty() {
-                        // ignore non-literal whitespace
-                        start = self.pos;
-                    } else {
-                        // yield next argument separated by this whitespace
-                        return Some(Ok(arg));
-                    }
-                }
-
-                // implicitly add this character to the current argument
-                _ => continue,
             }
         }
     }
