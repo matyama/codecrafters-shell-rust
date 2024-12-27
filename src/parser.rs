@@ -257,7 +257,7 @@ impl<'a> Iterator for ArgsIter<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum OutputMode {
     Redirect { fd: i32, path: PathBuf, force: bool },
-    // TODO: Append
+    Append { fd: i32, path: PathBuf },
 }
 
 pub fn parse_output_mode<'a, I>(args: I) -> Result<(Vec<Arg<'a>>, HashMap<i32, OutputMode>), Error>
@@ -268,6 +268,15 @@ where
     let mut outputs = HashMap::new();
     let mut output = None;
 
+    macro_rules! pathbuf {
+        ($path:expr) => {{
+            match $path {
+                Cow::Borrowed(path) => PathBuf::from(path),
+                Cow::Owned(path) => PathBuf::from(path),
+            }
+        }};
+    }
+
     // NOTE: `$ > test` will actually redirect stdin to `test` file, so ([], [<mode>]) is valid
     for arg in args {
         let arg = arg?;
@@ -275,11 +284,14 @@ where
         // check if arg belongs to the previously parsed redirect operator
         match output.take() {
             Some(OutputMode::Redirect { fd, force, .. }) => {
-                let path = match arg {
-                    Cow::Borrowed(path) => PathBuf::from(path),
-                    Cow::Owned(path) => PathBuf::from(path),
-                };
+                let path = pathbuf!(arg);
                 outputs.insert(fd, OutputMode::Redirect { fd, path, force });
+                continue;
+            }
+
+            Some(OutputMode::Append { fd, .. }) => {
+                let path = pathbuf!(arg);
+                outputs.insert(fd, OutputMode::Append { fd, path });
                 continue;
             }
 
@@ -288,9 +300,9 @@ where
                     input: _,
                     fd,
                     fd_arg,
-                    op: op @ (">" | ">|"),
+                    op,
                     word,
-                }) => {
+                }) if !op.is_empty() => {
                     if let Some(arg) = fd_arg {
                         arguments.push(Cow::Owned(arg));
                     }
@@ -298,10 +310,24 @@ where
                     let incomplete = word.is_empty();
 
                     // TODO: path could be a nested command
-                    let redirect = OutputMode::Redirect {
-                        fd,
-                        path: PathBuf::from(word),
-                        force: op == ">|",
+                    let path = PathBuf::from(word);
+
+                    let redirect = match op {
+                        ">" => OutputMode::Redirect {
+                            fd,
+                            path,
+                            force: false,
+                        },
+
+                        ">|" => OutputMode::Redirect {
+                            fd,
+                            path,
+                            force: true,
+                        },
+
+                        ">>" => OutputMode::Append { fd, path },
+
+                        op => unimplemented!("'{op}' output mode"),
                     };
 
                     if incomplete {
@@ -310,8 +336,6 @@ where
                         outputs.insert(fd, redirect);
                     }
                 }
-
-                Ok(Redirect { op, .. }) if !op.is_empty() => unimplemented!("'{op}' output mode"),
 
                 Ok(Redirect { input, .. }) | Err(input) => arguments.push(input),
             },
@@ -515,6 +539,7 @@ mod tests {
             .into_iter()
             .map(|mode| match mode {
                 mode @ OutputMode::Redirect { fd, .. } => (fd, mode),
+                mode @ OutputMode::Append { fd, .. } => (fd, mode),
             })
             .collect::<HashMap<_, _>>();
 
@@ -663,5 +688,26 @@ mod tests {
 
         let err = parse_output_mode(args).expect_err("redirect parsing error");
         assert!(matches!(err, Error::Syntax(_)), "expected syntax error");
+    }
+
+    #[test]
+    fn parse_redirect_append() {
+        test_parse_output_mode(
+            args!["echo", "foo", ">>", "/tmp/bar"],
+            args!["echo", "foo"],
+            vec![OutputMode::Append {
+                fd: 1,
+                path: PathBuf::from("/tmp/bar"),
+            }],
+        );
+
+        test_parse_output_mode(
+            args!["echo", "foo", ">>/tmp/bar"],
+            args!["echo", "foo"],
+            vec![OutputMode::Append {
+                fd: 1,
+                path: PathBuf::from("/tmp/bar"),
+            }],
+        );
     }
 }

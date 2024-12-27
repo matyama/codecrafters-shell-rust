@@ -46,6 +46,18 @@ pub fn redirect(outputs: HashMap<i32, OutputMode>) -> Result<(impl OutputIO, imp
                     file.truncate(true).open(path).map(OutputWriter::File)?
                 }
 
+                Some(OutputMode::Append { path, .. }) => {
+                    if let Some(prefix) = path.parent() {
+                        fs::create_dir_all(prefix)?;
+                    }
+
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                        .map(OutputWriter::File)?
+                }
+
                 None => OutputWriter::Std($stdio),
             }
         }};
