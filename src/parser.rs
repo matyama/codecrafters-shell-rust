@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::str::Chars;
 
 use crate::error::Error;
@@ -252,6 +254,166 @@ impl<'a> Iterator for ArgsIter<'a> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutputMode {
+    Redirect { fd: i32, path: PathBuf, force: bool },
+    // TODO: Append
+}
+
+pub fn parse_output_mode<'a, I>(args: I) -> Result<(Vec<Arg<'a>>, HashMap<i32, OutputMode>), Error>
+where
+    I: IntoIterator<Item = Result<Cow<'a, str>, Error>>,
+{
+    let mut arguments = Vec::new();
+    let mut outputs = HashMap::new();
+    let mut output = None;
+
+    // NOTE: `$ > test` will actually redirect stdin to `test` file, so ([], [<mode>]) is valid
+    for arg in args {
+        let arg = arg?;
+
+        // check if arg belongs to the previously parsed redirect operator
+        match output.take() {
+            Some(OutputMode::Redirect { fd, force, .. }) => {
+                let path = match arg {
+                    Cow::Borrowed(path) => PathBuf::from(path),
+                    Cow::Owned(path) => PathBuf::from(path),
+                };
+                outputs.insert(fd, OutputMode::Redirect { fd, path, force });
+                continue;
+            }
+
+            None => match parse_redirect(arg) {
+                Ok(Redirect {
+                    input: _,
+                    fd,
+                    fd_arg,
+                    op: op @ (">" | ">|"),
+                    word,
+                }) => {
+                    if let Some(arg) = fd_arg {
+                        arguments.push(Cow::Owned(arg));
+                    }
+
+                    let incomplete = word.is_empty();
+
+                    // TODO: path could be a nested command
+                    let redirect = OutputMode::Redirect {
+                        fd,
+                        path: PathBuf::from(word),
+                        force: op == ">|",
+                    };
+
+                    if incomplete {
+                        output = Some(redirect);
+                    } else {
+                        outputs.insert(fd, redirect);
+                    }
+                }
+
+                Ok(Redirect { op, .. }) if !op.is_empty() => unimplemented!("'{op}' output mode"),
+
+                Ok(Redirect { input, .. }) | Err(input) => arguments.push(input),
+            },
+        }
+    }
+
+    // check for trailing redirect operator without an argument
+    if output.is_some() {
+        Err(Error::Syntax(String::from("unexpected token `newline'")))
+    } else {
+        Ok((arguments, outputs))
+    }
+}
+
+struct Redirect<'a> {
+    input: Arg<'a>,
+    fd: i32,
+    fd_arg: Option<String>,
+    op: &'static str,
+    word: String,
+}
+
+fn parse_redirect(input: Arg<'_>) -> Result<Redirect<'_>, Arg<'_>> {
+    let mut chars = input.chars().peekable();
+
+    let mut fd = 1;
+    let mut fd_arg = None;
+    let mut op = None;
+    let mut pos = 0;
+
+    while let Some(c) = chars.next() {
+        match c {
+            // file descriptor (an optional leading integer)
+            c if pos == 0 && c.is_ascii_digit() => {
+                pos += 1;
+                while chars.next_if(char::is_ascii_digit).is_some() {
+                    pos += 1;
+                }
+                // NOTE: bash treats large numbers not as a fd, but rather as an extra arg for echo
+                match input[..pos].parse() {
+                    Ok(n) => fd = n,
+                    Err(_) => fd_arg = Some(input[..pos].to_string()),
+                };
+            }
+
+            '>' => match chars.peek() {
+                // append
+                Some('>') => {
+                    op = Some(">>");
+                    pos += 2;
+                    let _ = chars.next();
+                }
+
+                // redirect as if noclobber was not set
+                Some('|') => {
+                    op = Some(">|");
+                    pos += 2;
+                    let _ = chars.next();
+                }
+
+                // `>&word` should be semantically equivalent to `>word 2>&1`
+                Some('&') => unimplemented!("redirecting with >&word"),
+
+                // simple redirect
+                Some(_) | None => {
+                    op = Some(">");
+                    pos += 1;
+                }
+            },
+
+            // TODO matches one of the following
+            //  - appending stdout and stderr: &>> which is equivalent to >>word 2>&1
+            //  - here strings (and documents): [n]<<< word
+            //  - duplicating file descriptors: [n]<&word and [n]>&word
+            //  - moving fds: [n]<&digit- and [n]>&digit-
+            //  - opening fds to R/W: [n]<>word
+            _ => break,
+        }
+    }
+
+    if let Some(op) = op {
+        let word = input[pos..].to_string();
+        Ok(Redirect {
+            input,
+            fd,
+            fd_arg,
+            op,
+            word,
+        })
+    } else {
+        Err(input)
+    }
+}
+
+pub fn parse_shell_name(executable: String) -> String {
+    Path::new(&executable)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +496,172 @@ mod tests {
 
         let args = parse(r#"echo "mixed\"quote'hello'\\""#).expect("no parsing error");
         assert_eq!(args, vec!["echo", r#"mixed"quote'hello'\"#]);
+    }
+
+    macro_rules! args {
+        ($($arg:literal),*) => {
+            vec![$(Cow::Owned($arg.to_string()),)*]
+        }
+    }
+
+    fn test_parse_output_mode(
+        args: Vec<Cow<'_, str>>,
+        expected_args: Vec<Cow<'_, str>>,
+        expected_mode: Vec<OutputMode>,
+    ) {
+        let args = args.into_iter().map(Ok).collect::<Vec<_>>();
+
+        let expected_mode = expected_mode
+            .into_iter()
+            .map(|mode| match mode {
+                mode @ OutputMode::Redirect { fd, .. } => (fd, mode),
+            })
+            .collect::<HashMap<_, _>>();
+
+        let (actual_args, actual_mode) = parse_output_mode(args).expect("redirect parsing error");
+        assert_eq!(expected_args, actual_args);
+        assert_eq!(expected_mode, actual_mode);
+    }
+
+    #[test]
+    fn parse_redirect_no_output() {
+        test_parse_output_mode(args![], args![], vec![]);
+        test_parse_output_mode(args!["echo", "foo"], args!["echo", "foo"], vec![]);
+    }
+
+    #[test]
+    fn parse_redirect_trailing() {
+        test_parse_output_mode(
+            args!["echo", "foo", ">", "/tmp/bar"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("/tmp/bar"),
+                force: false,
+            }],
+        );
+
+        test_parse_output_mode(
+            args!["echo", "foo", ">/tmp/bar"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("/tmp/bar"),
+                force: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_non_trailing() {
+        test_parse_output_mode(
+            args!["echo", "foo", ">", "test", "echo", "bar"],
+            args!["echo", "foo", "echo", "bar"],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("test"),
+                force: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_explicit_fd() {
+        test_parse_output_mode(
+            args!["echo", "foo", "2>", "test"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 2,
+                path: PathBuf::from("test"),
+                force: false,
+            }],
+        );
+
+        test_parse_output_mode(
+            args!["echo", "foo", "22>", "test"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 22,
+                path: PathBuf::from("test"),
+                force: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_preceding_non_fd_number() {
+        test_parse_output_mode(
+            args![
+                "echo",
+                "foo",
+                "2000000000000000000000000000000000000000>test",
+                "bar"
+            ],
+            args![
+                "echo",
+                "foo",
+                "2000000000000000000000000000000000000000",
+                "bar"
+            ],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("test"),
+                force: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_force_overwrite() {
+        test_parse_output_mode(
+            args!["echo", "foo", ">|", "test"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("test"),
+                force: true,
+            }],
+        );
+
+        test_parse_output_mode(
+            args!["echo", "foo", ">|test"],
+            args!["echo", "foo"],
+            vec![OutputMode::Redirect {
+                fd: 1,
+                path: PathBuf::from("test"),
+                force: true,
+            }],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_muliple_outputs() {
+        test_parse_output_mode(
+            args!["echo", "hello", ">", "test1", "echo", "world", ">test2"],
+            args!["echo", "hello", "echo", "world"],
+            vec![
+                OutputMode::Redirect {
+                    fd: 1,
+                    path: PathBuf::from("test1"),
+                    force: false,
+                },
+                OutputMode::Redirect {
+                    fd: 1,
+                    path: PathBuf::from("test2"),
+                    force: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_redirect_syntax_error() {
+        let args = args!["echo", "foo", ">"]
+            .into_iter()
+            .map(Ok)
+            .collect::<Vec<_>>();
+
+        let err = parse_output_mode(args).expect_err("redirect parsing error");
+        assert!(matches!(err, Error::Syntax(_)), "expected syntax error");
     }
 }

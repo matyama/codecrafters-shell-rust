@@ -7,6 +7,9 @@ pub enum Error {
     #[error("{0}")]
     Quote(Quote),
 
+    #[error("syntax error near {0}")]
+    Syntax(String),
+
     #[error("{0}: command not found")]
     CommandNotFound(String),
 
